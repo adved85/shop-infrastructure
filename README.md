@@ -57,10 +57,10 @@ Where this is headed next: [docs/roadmap.md](docs/roadmap.md).
 | File | Purpose |
 |---|---|
 | `compose.yml` | The production-safe base. Only publishes `80`/`443`. → [docs/compose.md](docs/compose.md) |
-| `compose.override.yml` | Adds `5432`/`6379`/`5672`/`15672` to `localhost`, for local dev convenience. Auto-merged by Compose when present — **not used in production**. |
+| `compose.dev.yml` | Local development only: publishes `5432`/`6379`/`5672`/`15672` to `localhost` and turns on the API's debug mode. Applied only when passed explicitly with `-f`, **never in production**. |
 | `proxy/default.conf` | nginx routing config. → [docs/nginx.md](docs/nginx.md) |
 | `.env.example` | Template for the real env file — committed, no real secrets. → [docs/environment.md](docs/environment.md) |
-| `.env.prod` | Real secrets. **Git-ignored, never commit this.** |
+| `.env` | Real secrets. **Git-ignored, never commit this.** |
 | `docs/hands-on.md` | Commands to validate config before `up`, and to inspect/debug the running stack. |
 | `docs/roadmap.md` | Where this project is headed — done/next/future phases. |
 | `docs/plans/` | Raw working notes behind the roadmap (git-ignored — personal reference, not published). |
@@ -71,36 +71,47 @@ The same two application images run in both places, unchanged. Only this differs
 
 | | Local | Production |
 |---|---|---|
-| Command | `docker compose --env-file .env.prod up -d` | `docker compose -f compose.yml --env-file .env.prod up -d` |
-| Postgres / Redis / RabbitMQ ports | published to `localhost` via `compose.override.yml` | not published at all |
+| Command | `docker compose -f compose.yml -f compose.dev.yml up -d` | `docker compose up -d` |
+| Postgres / Redis / RabbitMQ ports | published to `localhost` via `compose.dev.yml` | not published at all |
 | Reached at | `http://localhost` | `https://yourdomain.com` |
 | TLS | none | domain + certificate (not yet set up) |
-| `.env.prod` contents | throwaway secrets | real secrets |
+| `.env` contents | throwaway secrets | real secrets |
 
-The `-f compose.yml` flag is the whole mechanism: it excludes `compose.override.yml`, so
-nothing but the proxy is reachable from outside the machine.
+Note which one needs the extra typing. `compose.dev.yml` is deliberately *not* named
+`compose.override.yml` — Compose would auto-merge that one with no flags, which would make
+the convenient command and the dangerous command the same command. As it stands, forgetting
+a flag on the server changes nothing; forgetting one locally just means a GUI tool can't
+reach Postgres.
 
 This only works because the frontend calls the API at the **relative** path `/api` rather
 than a hardcoded hostname. The browser resolves that against whichever origin served the
 page — `http://localhost/api/...` locally, `https://yourdomain.com/api/...` in production —
 so one published image is correct everywhere, and there's no cross-origin request and
 therefore no CORS configuration anywhere in the stack. That value is baked into the bundle
-at build time from the `VITE_API_URL` repository variable in `react-shop-client`; changing
-it requires publishing a new frontend release, not editing anything here.
+at build time, from the `ARG VITE_API_URL=/api` default in `react-shop-client`'s Dockerfile;
+changing it requires publishing a new frontend release, not editing anything here.
 
 ## Getting started — local
 
 ```bash
 git clone https://github.com/adved85/shop-infrastructure.git
 cd shop-infrastructure
-cp .env.example .env.prod
-# edit .env.prod: replace every CHANGE_ME with a real value
+cp .env.example .env
+# edit .env: replace every CHANGE_ME with a real value
 #   openssl rand -base64 32
 
-docker compose --env-file .env.prod config --quiet && echo "config OK"
-docker compose --env-file .env.prod up -d
+export COMPOSE_FILE=compose.yml:compose.dev.yml   # optional: saves repeating -f
+docker compose config --quiet && echo "config OK"
+docker compose up -d
 docker compose ps          # wait for everything to report "healthy"
 ```
+
+Without that `export`, pass the files explicitly each time:
+`docker compose -f compose.yml -f compose.dev.yml up -d`
+
+**Next: [First start](docs/hands-on.md#first-start--from-an-empty-database-to-a-working-login)**,
+the steps from an empty database to a logged-in admin, in order. Migrations have already
+run by this point.
 
 If something doesn't come up healthy — or you just want to look around inside the running
 stack — [docs/hands-on.md](docs/hands-on.md) has the commands for inspecting containers,
@@ -110,7 +121,7 @@ Then:
 - App: http://localhost/
 - API: http://localhost/api/...
 - Postgres/Redis/RabbitMQ are also reachable on `localhost` at their default ports
-  (`compose.override.yml` merges in automatically) — see
+  (courtesy of `compose.dev.yml`) — see
   [docs/environment.md](docs/environment.md#software-for-the-locally-exposed-ports) for
   suggested GUI tools (TablePlus/DBeaver for Postgres, RedisInsight for Redis).
 
@@ -122,13 +133,13 @@ To tear down: `docker compose down` (add `-v` to also delete the named volumes/d
 # on the server, after Docker + the Compose plugin are installed:
 git clone https://github.com/adved85/shop-infrastructure.git
 cd shop-infrastructure
-cp .env.example .env.prod   # or scp a prepared .env.prod from elsewhere — never commit it
-# edit .env.prod with real production secrets
+cp .env.example .env   # or scp a prepared .env from elsewhere — never commit it
+# edit .env with real production secrets
 
-# note: -f compose.yml explicitly excludes compose.override.yml,
-# so Postgres/Redis/RabbitMQ are never exposed outside the server
-docker compose -f compose.yml --env-file .env.prod up -d
-docker compose -f compose.yml ps
+# the plain command uses compose.yml only — compose.dev.yml is never
+# applied unless explicitly passed, so Postgres/Redis/RabbitMQ stay unexposed
+docker compose up -d
+docker compose ps
 ```
 
 HTTPS is not yet configured — it requires a real registered domain (Let's Encrypt cannot
@@ -147,6 +158,10 @@ don't have to be rediscovered:
 
 - **`api` speaks FastCGI, not HTTP.** php-fpm listens on port `9000`; nginx must use
   `fastcgi_pass`, never `proxy_pass`, to reach it. See [docs/nginx.md](docs/nginx.md).
+- **A missing `APP_KEY` is invisible to every health check.** The container starts, php-fpm
+  serves, and `health:check` passes — but the app throws on anything needing encryption.
+  It's also the one secret you must *not* rotate. See
+  [docs/environment.md](docs/environment.md#app_key--the-one-that-fails-silently).
 - **`frontend` needs no runtime environment variables.** Its API URL is baked into the
   built JS bundle at image build time by its own CI, not read at container start.
 - **Every service only receives the env vars it actually needs** — no blanket `env_file:`.
@@ -155,7 +170,7 @@ don't have to be rediscovered:
   [docs/environment.md](docs/environment.md#why-each-service-only-sees-the-variables-it-needs).
 - **`ports:` only controls host/internet reachability** — container-to-container traffic
   always goes over the internal Compose network by service name, regardless of whether a
-  port is published. This is why `compose.override.yml` exists as a separate file rather
+  port is published. This is why `compose.dev.yml` exists as a separate, opt-in file rather
   than editing `compose.yml` directly.
 - **RabbitMQ's management UI needs the `-management` image variant.** The plain `rabbitmq`
   image ships only the `rabbitmq_prometheus` plugin, so port `15672` would answer nothing —
@@ -168,6 +183,10 @@ don't have to be rediscovered:
 - **Image versions are not arbitrary.** `API_VERSION`/`FRONTEND_VERSION` must match a tag
   each app repo's own CI actually published to GHCR (triggered by pushing a git tag, e.g.
   `v0.1.0`) — see [docs/environment.md](docs/environment.md#api_version--frontend_version).
+- **Migrations run automatically, before the app starts.** A one-shot `migrate` service
+  applies them on every `up`, and `api` waits for it to exit successfully. A failed
+  migration keeps the app down rather than letting it run against a broken schema. See
+  [docs/compose.md](docs/compose.md#the-migrate-service).
 - **Healthchecks gate startup order**, not just container start order — `api` won't start
   before Postgres/Redis/RabbitMQ are healthy, and `proxy` won't start before `api`/`frontend`
   are. `api`'s check is `php artisan health:check`, a real application-level readiness probe

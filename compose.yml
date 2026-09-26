@@ -1,5 +1,15 @@
 name: shop
 
+# Laravel's database connection, defined once and shared by `api` and `migrate`
+# so the two can never point at different databases.
+x-db-env: &db-env
+  DB_CONNECTION: pgsql
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_DATABASE: ${POSTGRES_DB}
+  DB_USERNAME: ${POSTGRES_USER}
+  DB_PASSWORD: ${POSTGRES_PASSWORD}
+
 services:
   redis:
     image: redis:8-alpine
@@ -50,7 +60,7 @@ services:
     image: nginx:1.31-alpine
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/nginx-health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/nginx-health"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -71,6 +81,7 @@ services:
   
   api:
     image: ghcr.io/adved85/laravel-shop-api:${API_VERSION}
+    restart: unless-stopped
     # image: docker.io/adved85/laravel-shop-api:${API_VERSION}
     healthcheck:
       # Timeout must exceed ReadinessChecker's own 3s per-dependency timeout,
@@ -81,12 +92,14 @@ services:
       retries: 3
       start_period: 30s
     environment:
-      DB_CONNECTION: pgsql
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_DATABASE: ${POSTGRES_DB}
-      DB_USERNAME: ${POSTGRES_USER}
-      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      # Laravel refuses to encrypt/decrypt anything without this, but the
+      # container still starts and health:check still passes without it —
+      # so a missing APP_KEY fails silently at request time, not at boot.
+      APP_KEY: ${APP_KEY}
+      # Laravel's own logs go to stderr, so `docker compose logs api` shows them.
+      LOG_CHANNEL: stderr
+
+      <<: *db-env
 
       CACHE_STORE: redis
       REDIS_HOST: ${REDIS_HOST}
@@ -102,6 +115,10 @@ services:
       RABBITMQ_QUEUE: default
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS}
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       postgres:
         condition: service_healthy
@@ -109,12 +126,27 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # One-shot: runs pending migrations, then exits. `api` won't start unless it
+  # exits 0, so the app never runs against a half-migrated schema.
+  migrate:
+    image: ghcr.io/adved85/laravel-shop-api:${API_VERSION}
+    command: ["php", "artisan", "migrate", "--force"]
+    restart: "no"
+    environment:
+      <<: *db-env
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   frontend:
     image: ghcr.io/adved85/react-shop-client:${FRONTEND_VERSION}
+    restart: unless-stopped
     # image: docker.io/adved85/react-shop-client:${FRONTEND_VERSION}
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/"]
       interval: 10s
       timeout: 3s
       retries: 3

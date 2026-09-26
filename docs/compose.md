@@ -1,4 +1,4 @@
-# `compose.yml` and `compose.override.yml`
+# `compose.yml` and `compose.dev.yml`
 
 Related: [nginx.md](./nginx.md) · [environment.md](./environment.md) · [roadmap.md](./roadmap.md) · [hands-on.md](./hands-on.md) · [README](../README.md)
 
@@ -9,20 +9,32 @@ it only publishes ports `80` and `443` (the `proxy` service) — every other ser
 (Postgres, Redis, RabbitMQ) is reachable *only* from other containers on the internal
 Docker network, never from the host machine or the internet.
 
-`compose.override.yml` adds back host-port mappings for Postgres, Redis and RabbitMQ,
-purely for local convenience (so you can point a GUI tool like TablePlus, RedisInsight,
-etc. at `localhost`). Docker Compose automatically merges an override file that sits next
-to `compose.yml` in the same directory — you don't need to pass any extra flag locally:
+`compose.dev.yml` adds back host-port mappings for Postgres, Redis and RabbitMQ, purely for
+local convenience (so you can point a GUI tool like TablePlus or RedisInsight at
+`localhost`). It applies only when you ask for it explicitly:
 
 ```bash
-# local (compose.yml + compose.override.yml merged automatically)
-docker compose --env-file .env.prod up -d
+# local — opt in to the extra published ports
+docker compose -f compose.yml -f compose.dev.yml up -d
 
-# production (compose.override.yml explicitly excluded)
-docker compose -f compose.yml --env-file .env.prod up -d
+# production — the plain command is already the safe one
+docker compose up -d
 ```
 
-The reasoning behind this split is explained in more detail in
+### Why not `compose.override.yml`
+
+Compose auto-merges a file named `compose.override.yml` with no flags at all, which is the
+more conventional choice and saves typing locally. It was rejected deliberately: with
+auto-merge, **forgetting a flag on the server silently publishes Postgres, Redis and
+RabbitMQ to the internet** — and Redis here has no password. The safe path would depend on
+remembering `-f compose.yml` on every command, forever.
+
+Naming the file `compose.dev.yml` inverts that. It's invisible unless explicitly requested,
+so the worst outcome of forgetting a flag is a GUI tool that can't connect locally. The
+convenient default and the dangerous default are now different things, which is the whole
+point.
+
+More on the two-network-paths reasoning in
 [environment.md](./environment.md#local-vs-production-ports).
 
 ## Services
@@ -64,17 +76,83 @@ application code are deliberately kept in separate repositories:
 
 ## Startup order: healthchecks, not just start order
 
-Every service has a real `healthcheck:`, and every `depends_on` uses
-`condition: service_healthy` rather than plain start-order. Concretely:
+Every long-running service has a real `healthcheck:`, and every `depends_on` waits on a
+condition rather than plain start order. Concretely:
 
 ```
-postgres, redis, rabbitmq  (healthy) ──▶ api  (healthy) ──▶ proxy
-                                          frontend (healthy) ──▶ proxy
+postgres (healthy) ──▶ migrate (exited 0) ──┐
+postgres, redis, rabbitmq (healthy) ────────┴──▶ api (healthy) ──┐
+                                   frontend (healthy) ───────────┴──▶ proxy
 ```
 
 This means `api` will not even attempt to start until Postgres, Redis and RabbitMQ all
-report healthy, and `proxy` won't start until *both* `api` and `frontend` report healthy —
-so nginx never comes up routing traffic to a backend that isn't actually ready yet.
+report healthy **and** migrations have finished successfully, and `proxy` won't start until
+*both* `api` and `frontend` report healthy. So nginx never comes up routing traffic to a
+backend that isn't ready, and the app never runs against a half-migrated schema.
+
+### The `migrate` service
+
+A one-shot container that uses the same API image with a different command:
+
+```yaml
+migrate:
+  image: ghcr.io/adved85/laravel-shop-api:${API_VERSION}
+  command: ["php", "artisan", "migrate", "--force"]
+  restart: "no"
+  environment:
+    <<: *db-env
+  depends_on:
+    postgres:
+      condition: service_healthy
+```
+
+It waits for Postgres, applies any pending migrations, and exits. `api` depends on it with
+`condition: service_completed_successfully`, a third kind of condition alongside
+`service_healthy` and `service_started`, which waits for a container to *finish* with exit
+code `0`. A failed migration therefore stops `api` from starting at all, rather than letting
+it serve traffic against a broken schema. On a database that's already current it just
+prints `Nothing to migrate` and exits in a second or two.
+
+Details that matter:
+
+- **The image's entrypoint still runs** before the command (`config:cache` and so on), so
+  Laravel's config is built from this container's environment exactly as it is for `api`.
+- **`--force`** is required because the image runs with `APP_ENV=production`, where
+  `migrate` stops to ask *"Are you sure?"*, and a container has nobody to answer.
+- **The command is a list of separate words:** `["php", "artisan", "migrate", "--force"]`.
+  Writing `["php artisan migrate", "--force"]` would make Docker look for a single program
+  literally named `php artisan migrate`.
+- **`restart: "no"` is quoted** because in YAML a bare `no` is the boolean *false*, not the
+  word. (It's also the default, so it could be left out; it's there to state the intent.)
+- **It gets only the database variables**, through the shared `x-db-env` anchor below. It
+  has no use for `APP_KEY`, Redis or RabbitMQ, so it isn't given them.
+- `docker compose ps` doesn't list it once it has exited; `docker compose ps -a` shows
+  `Exited (0)`. Run it again on demand with `docker compose run --rm migrate`.
+
+### One database config for two services: `x-db-env`
+
+`api` and `migrate` must point at the same database, so its settings are defined once at the
+top of the file as a YAML **anchor** and pulled into both:
+
+```yaml
+x-db-env: &db-env          # the "x-" prefix tells Compose to ignore this key
+  DB_CONNECTION: pgsql
+  DB_HOST: postgres
+  # ...
+
+services:
+  api:
+    environment:
+      <<: *db-env           # merge those keys in here
+      APP_KEY: ${APP_KEY}
+      # ...
+  migrate:
+    environment:
+      <<: *db-env
+```
+
+Copying the block into both services would work until the day someone changed the password
+in one place and not the other, and migrations ran against a database the app couldn't reach.
 
 ### What actually makes a check pass: the exit code
 
@@ -118,10 +196,10 @@ What each healthcheck actually does, and why the command differs per service:
   `${VAR}`, so it always matches whatever the container is actually running with.
 - **`redis`**: `redis-cli ping`.
 - **`rabbitmq`**: `rabbitmq-diagnostics -q ping`.
-- **`proxy`**: `wget --spider http://localhost/nginx-health` — a dedicated endpoint (see
+- **`proxy`**: `wget --spider http://127.0.0.1/nginx-health` — a dedicated endpoint (see
   [nginx.md](./nginx.md)) that checks nginx itself, independent of whether
   `frontend`/`api` are healthy.
-- **`frontend`**: `wget --spider http://localhost/` — its own bundled nginx serves the
+- **`frontend`**: `wget --spider http://127.0.0.1/` — its own bundled nginx serves the
   static build directly, so a plain HTTP check is meaningful here.
 - **`api`**: `php artisan health:check` — see the story below.
 
@@ -179,9 +257,62 @@ is `depends_on: service_healthy`, which is genuinely asking "can this serve traf
 Note that Compose only ever uses the **console** form. The `/health/live` and
 `/health/ready` HTTP endpoints are routed by the proxy and reachable by hand, but no
 healthcheck in this file calls them — a Docker healthcheck runs inside the container it
-checks, and `api` has no HTTP listener for one to talk to. See
-[nginx.md](./nginx.md#who-calls-these-nothing-yet--and-thats-deliberate) for who those
-endpoints are actually for.
+checks, and `api` has no HTTP listener for one to talk to. Nothing calls them
+automatically yet; see
+[nginx.md](./nginx.md#who-calls-these-no-docker-healthcheck--only-you-for-now) for who
+they're for.
+
+## Restart policies
+
+Every service has one. Without it Docker's default is `no`, so after a server reboot the
+services with a policy would come back and the ones without would stay down. For `api` and
+`frontend` that would mean nginx healthy and returning 502 for everything.
+
+| Policy | Used by | Behaviour |
+|---|---|---|
+| `always` | `postgres`, `redis`, `rabbitmq` | Restarts on exit and on daemon/host restart, **even if you'd stopped it by hand** |
+| `unless-stopped` | `proxy`, `api`, `frontend` | Same, except a container you stopped deliberately stays stopped across a reboot |
+
+`unless-stopped` is the friendlier choice for stateless services: `docker compose stop api`
+while debugging means what it says. The difference only shows up after a Docker daemon or
+host restart.
+
+**A restart policy does not react to `unhealthy`.** It fires when the container's main
+process *exits*, nothing else. A container stuck `(unhealthy)` keeps running unhealthy, since
+plain Docker and Compose never restart on health status (orchestrators like Swarm and
+Kubernetes do). Here, health status gates startup ordering via `depends_on`. Recovering a
+crashed process is the restart policy's job. The two are separate mechanisms.
+
+## Logs
+
+Two separate settings on `api`, which look related but belong to different programs:
+
+```yaml
+api:
+  environment:
+    LOG_CHANNEL: stderr        # Laravel: where the app writes its logs
+  logging:                     # Docker: how it stores what the container prints
+    options:
+      max-size: "10m"
+      max-file: "3"
+```
+
+**`LOG_CHANNEL: stderr`** is a Laravel setting, so it lives under `environment:`. By default
+Laravel writes to `storage/logs/laravel.log` *inside the container*, where
+`docker compose logs` can't see it. With `stderr`, your `Log::warning(...)` calls (such as
+the ones `ReadinessChecker` makes) show up in `docker compose logs api`, from both php-fpm
+workers and `artisan` commands. The file stops being written.
+
+**`logging:`** configures Docker's own log storage and accepts only `driver` and `options`.
+Putting `LOG_CHANNEL` here gets the file rejected outright (`services.api.logging Additional
+property LOG_CHANNEL is not allowed`). By default Docker keeps a container's output in a
+JSON file that grows forever; `max-size`/`max-file` rotate it at 10 MB and keep 3 files,
+capping it at about 30 MB.
+
+**What stderr does *not* give you is durability.** Docker's log files belong to the
+container, and they're deleted when the container is removed (`down`, or recreated by `up`
+after a config change). Logs that outlive containers need shipping somewhere else, for
+example Loki with Grafana, which fits the monitoring stage in the [roadmap](./roadmap.md).
 
 ## Volumes
 

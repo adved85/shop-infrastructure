@@ -58,7 +58,7 @@ Two details that matter:
 - **`allow 127.0.0.1; allow ::1; deny all;`** — the readiness response tells the caller
   which backing services are currently down, which isn't something to hand to the public
   internet. Restricting to loopback means only something running *inside* the proxy
-  container can reach them: `docker compose exec proxy wget -qO- http://localhost/health/ready`
+  container can reach them: `docker compose exec proxy wget -qO- http://127.0.0.1/health/ready`
   for debugging, or a future healthcheck on the `proxy` service itself. External callers
   get a `403`. Relax the ACL to a monitoring system's address range if you later want
   external uptime checks.
@@ -68,16 +68,16 @@ Two details that matter:
   useful `503` with `{"rabbitmq": "error"}` in the body. Same layering principle as the
   Docker healthcheck timeout described in [compose.md](./compose.md#how-the-api-healthcheck-got-better).
 
-### Who calls these? Nothing yet — and that's deliberate
+### Who calls these? No Docker healthcheck — only you, for now
 
 Worth stating plainly, because it's confusing otherwise: **no healthcheck in `compose.yml`
-calls these two endpoints.** Every automated check in the stack uses something else —
+calls these two endpoints.** Every Docker healthcheck in the stack uses something else —
 
 | Service | Runs | Uses `/health/*`? |
 |---|---|---|
 | `api` | `php artisan health:check` | No — console, in-process |
 | `proxy` | `wget --spider .../nginx-health` | No — nginx's own endpoint |
-| `frontend` | `wget --spider http://localhost/` | No |
+| `frontend` | `wget --spider http://127.0.0.1/` | No |
 
 There's a concrete reason for each. A Docker healthcheck runs *inside* the container it
 checks, and the `api` container is php-fpm only — no HTTP server is listening in there, so
@@ -85,19 +85,19 @@ an HTTP probe against itself would connect to nothing. Hence the console command
 `proxy` could reach Laravel over HTTP, but deliberately checks `/nginx-health` instead so
 that nginx's health reflects nginx rather than its backends.
 
-So today these routes exist for manual use:
+So today these routes exist for manual use, from inside the proxy container:
 
 ```bash
-docker compose exec proxy wget -qO- http://localhost/health/ready
+docker compose exec proxy wget -qO- http://127.0.0.1/health/ready
 ```
 
-Their first automated consumer will be `healthcheck.sh` / `deploy.sh` (see
-[roadmap.md](./roadmap.md#next)) — "did this deploy succeed?" is a readiness question, and
+Their natural first automated consumer is the planned `healthcheck.sh` / `deploy.sh` (see
+[roadmap.md](./roadmap.md#next)). "Did this deploy succeed?" is a readiness question, and
 asking it through the proxy exercises the whole chain (nginx → FastCGI → Laravel →
-Postgres/Redis/RabbitMQ) rather than asking one container about itself. Beyond that they're
+Postgres/Redis/RabbitMQ) rather than asking one container about itself. Beyond that, these routes are
 the standard shape for an external uptime monitor, a load balancer deciding whether to route
-to a node, or Kubernetes `livenessProbe`/`readinessProbe` — none of which exist here yet,
-and the first two would need the loopback ACL relaxed.
+to a node, or Kubernetes `livenessProbe`/`readinessProbe`. None of those exist here yet, and
+the first two would need the loopback ACL relaxed.
 
 ## `location /api/` → `fastcgi_pass api:9000`
 
@@ -122,6 +122,30 @@ FastCGI parameters (`REQUEST_URI`, `QUERY_STRING`, `REQUEST_METHOD`, `REDIRECT_S
 etc.). Laravel's router specifically needs `REQUEST_URI` to route correctly, and php-fpm
 requires `REDIRECT_STATUS` to be set at all (a built-in security check) — replacing this
 line with only a handful of hand-picked `fastcgi_param` lines would silently break both.
+
+### This location is a contract — don't rename it casually
+
+Three separate pieces of software agree on the string `/api`, and nothing but convention
+enforces it:
+
+| Party | What it assumes |
+|---|---|
+| The frontend bundle | the API lives at `/api` on whatever origin served the page (`ARG VITE_API_URL=/api`, baked in at build time) |
+| This file | `location /api/` → `fastcgi_pass api:9000` |
+| Laravel | `withRouting(api: …)` puts every API route under `/api` |
+
+Changing it means changing all three, and publishing a new frontend image. The dangerous part
+is how a partial change *fails*: rename this location alone and nginx still starts, and
+**every container healthcheck stays green**. None of them sends a request through `/api/`.
+Meanwhile every browser API call falls through to `location /` and lands on the React
+container, which answers with its `index.html` (or a 405 for a POST). The whole application
+is broken, and no health check notices.
+
+The only thing that catches it is a request that actually goes through `/api/` and checks
+that Laravel answered: an unauthenticated `curl http://localhost/api/user` should return a
+401 *in JSON*. See [hands-on.md](./hands-on.md#touch-each-service-directly) for the manual
+check, and how to read what comes back. Automating it is a natural job for the planned
+`healthcheck.sh`.
 
 No prefix stripping happens here on purpose: `laravel-shop-api` registers `routes/api.php`
 with Laravel's own automatic `/api` prefix (see `bootstrap/app.php`'s

@@ -1,39 +1,86 @@
-# Environment files: `.env.example` and `.env.prod`
+# Environment files: `.env.example` and `.env`
 
 Related: [compose.md](./compose.md) · [nginx.md](./nginx.md) · [roadmap.md](./roadmap.md) · [hands-on.md](./hands-on.md) · [README](../README.md)
 
-## `.env.example` vs `.env.prod`
+## `.env.example` vs `.env`
 
 `.env.example` is committed to git — it documents every variable the stack needs, with
-placeholder values for anything secret. `.env.prod` is where the *real* values live, and it
+placeholder values for anything secret. `.env` is where the *real* values live, and it
 is deliberately **git-ignored** (see `.gitignore`) — it should never be committed, since it
 holds real database and message-broker passwords.
 
 To set up either environment (local or production), the process is the same:
 
 ```bash
-cp .env.example .env.prod
-# then edit .env.prod and replace every CHANGE_ME with a real generated secret:
+cp .env.example .env
+# then edit .env and replace every CHANGE_ME with a real generated secret:
 openssl rand -base64 32
 ```
 
-There is currently no separate `.env.dev` — the same `.env.prod` file is used for both
-local and production runs. What differs between the two is *which compose files* are
-combined (see below), not the environment variables themselves. A dedicated dev-only env
-file would mainly earn its keep if you want faster local iteration (e.g. pointing at a
-`latest`/locally-built image instead of a pinned release tag) or Laravel's debug mode
-enabled locally — neither has been needed yet.
+Compose reads `.env` from the project directory **automatically**, so no `--env-file` flag
+appears in any command here. (A differently-named file — `.env.prod`, say — would need
+`--env-file` passed every single time.)
+
+### Why it's `.env` and not `.env.prod`
+
+Because it isn't the *production* file — it's **this machine's** file. It's git-ignored, so
+every host has its own copy: your laptop's holds throwaway secrets, the server's holds real
+ones, and neither ever travels. Naming it after one environment would misdescribe both.
+
+What actually distinguishes local from production is which **compose files** you combine
+(see [compose.md](./compose.md#why-two-files-instead-of-one)), not which variables you set —
+the variable *names* are identical everywhere, only the values differ per machine.
+
+There's also no separate `.env.dev`. One would mainly earn its keep if you wanted faster
+local iteration (pointing at a `latest`/locally-built image instead of a pinned release) or
+Laravel's debug mode enabled locally — neither has been needed yet.
 
 ## Variable reference
 
 | Variable | Used by | Notes |
 |---|---|---|
+| `APP_KEY` | `api` | Laravel's encryption key. See the warning below — this one behaves differently from the other secrets. |
 | `POSTGRES_DB` | `postgres`, `api` | Database name. |
 | `POSTGRES_USER` | `postgres`, `api` | Must match what the healthcheck (`pg_isready -U ...`) expects — the two are wired to the same variable, so they can't drift. |
 | `POSTGRES_PASSWORD` | `postgres`, `api` | Generate with `openssl rand -base64 32`. Never reuse a password that's already been pasted somewhere insecure (chat, a screenshot, a public log) — treat it as compromised and rotate it. |
 | `REDIS_HOST` / `REDIS_PORT` | `api` | Points at the `redis` service over the internal Docker network. |
 | `RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS` | `rabbitmq`, `api` | Same rotation advice as the Postgres password. See the section below — these two names carry more weight than they look like they do. |
 | `API_VERSION` / `FRONTEND_VERSION` | `api`, `frontend` | See below. |
+
+## `APP_KEY` — the one that fails silently
+
+Laravel's encryption key, and the only secret here that can be missing without anything
+appearing to be wrong. Tested against the real image with no `APP_KEY` set:
+
+```
+status=running                 ← the container starts normally
+ready to handle connections    ← php-fpm is serving
+
+config('app.key')  →  NULL
+app('encrypter')   →  MissingAppKeyException: No application encryption key has been specified.
+```
+
+The container boots, php-fpm listens, the entrypoint's `config:cache` succeeds — and
+**`php artisan health:check` passes too**, because readiness probes Postgres, Redis and
+RabbitMQ and none of them resolve the encrypter. So a missing `APP_KEY` gives you six green
+containers and an application that throws the moment anything needs encryption. That's the
+one failure mode the health checks in this stack cannot see.
+
+Generate one with:
+
+```bash
+echo "base64:$(openssl rand -base64 32)"
+```
+
+**It is not rotatable like the other passwords.** A database password can be changed at will;
+`APP_KEY` is the key that *decrypts existing data*. Change it and anything encrypted under
+the old key — encrypted columns, signed URLs, password-reset tokens, encrypted cookies —
+becomes permanently unreadable. Generate it once per deployment and leave it alone.
+
+One thing the image gets right here: the entrypoint runs `config:cache` on **every**
+container start rather than at build time, so the key present in the environment at startup
+is the one that ends up in the cached config. A key added later is picked up on the next
+restart, with no stale cached `null` left behind.
 
 ## Telling the app to actually *use* the services
 
@@ -76,10 +123,22 @@ make every probe depend on Postgres.
 
 ## `VITE_API_URL` — why it isn't here
 
-The frontend's API base URL is the one setting you might expect in `.env.prod` and won't
-find. It's baked into the JavaScript bundle at **image build time** by `react-shop-client`'s
-CI (from a repository variable of that name), so by the time this repo pulls the image it's
-already fixed — no environment variable here can change it.
+The frontend's API base URL is the one setting you might expect in `.env` and won't
+find. It's baked into the JavaScript bundle at **image build time**, so by the time this
+repo pulls the image it's already fixed. No environment variable here can change it.
+
+Where it comes from is the Dockerfile in `react-shop-client` itself:
+
+```dockerfile
+ARG VITE_API_URL=/api
+```
+
+It used to be supplied by a GitHub repository variable. That was dropped for a good reason:
+the CI smoke-test build never passed the variable while the publish build did, so the image
+CI verified and the image that got published were built differently. With the default in
+the Dockerfile and nobody overriding it, both builds are identical. One trap is noted in
+that Dockerfile: passing an *empty* `--build-arg VITE_API_URL=` replaces the default rather
+than falling back to it, and ships a bundle with no API URL at all.
 
 Its value is the relative path **`/api`**, deliberately, and that choice is what lets one
 published image serve every environment. The browser resolves a relative path against
@@ -134,11 +193,11 @@ api:
 ```
 
 That mapping is the important part: there is exactly **one** place a credential is defined
-(`.env.prod`), so the broker's account and the app's login cannot drift apart. Defining a
+(`.env`), so the broker's account and the app's login cannot drift apart. Defining a
 second pair of variables for the app side would work right up until somebody rotated one and
 not the other.
 
-Note also that `.env.prod` holds only the two `RABBITMQ_DEFAULT_*` credentials. Host, port,
+Note also that `.env` holds only the two `RABBITMQ_DEFAULT_*` credentials. Host, port,
 vhost and queue name are hardcoded in `compose.yml` instead, because they're topology
 constants — identical in every environment — exactly like `DB_HOST: postgres` and
 `DB_PORT: 5432`. Only secrets and per-deployment choices belong in the env file.
@@ -185,7 +244,7 @@ verify something unreleased; keep production pinned to semver, which carries rel
 
 ## Why each service only sees the variables it needs
 
-`compose.yml` does **not** use a blanket `env_file: .env.prod` on every service. Each
+`compose.yml` does **not** use a blanket `env_file: .env` on every service. Each
 service's `environment:` block explicitly lists only the variables it actually needs:
 
 ```yaml
@@ -207,17 +266,17 @@ database or broker password.
 
 ## Local vs. production ports
 
-`.env.prod`'s variables never change between local and production use — what changes is
+`.env`'s variables never change between local and production use — what changes is
 which `docker compose` invocation you run:
 
 ```bash
-# local — compose.override.yml merges in automatically, exposing
+# local — opt in to compose.dev.yml, exposing
 # 5432 / 6379 / 5672 / 15672 on localhost for GUI tools
-docker compose --env-file .env.prod up -d
+docker compose -f compose.yml -f compose.dev.yml up -d
 
-# production — compose.override.yml explicitly excluded, so only
-# 80 / 443 (proxy) are ever reachable from outside the server
-docker compose -f compose.yml --env-file .env.prod up -d
+# production — the plain command, so only 80 / 443 (proxy)
+# are ever reachable from outside the server
+docker compose up -d
 ```
 
 The reasoning: `api` reaches Postgres/Redis/RabbitMQ over the internal Docker network by
@@ -228,7 +287,7 @@ in [compose.md](./compose.md#why-two-files-instead-of-one).
 
 ### Software for the locally-exposed ports
 
-With `compose.override.yml` merged in, these are reachable from your own machine:
+With `compose.dev.yml` included, these are reachable from your own machine:
 
 | Port | Service | Suggested tools |
 |---|---|---|
@@ -236,3 +295,34 @@ With `compose.override.yml` merged in, these are reachable from your own machine
 | `6379` | Redis | RedisInsight, Redis Commander, `redis-cli` |
 | `5672` | RabbitMQ (AMQP) | Used by application code, not something you browse directly |
 | `15672` | RabbitMQ management UI | Open http://localhost:15672 in a browser and log in with `RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS`. Works because the image is pinned to `rabbitmq:4-management` — the plain `rabbitmq` image does **not** enable the `rabbitmq_management` plugin, so this port would answer nothing. |
+
+## Local-only: debug mode
+
+`compose.dev.yml` also switches the API into debug mode, locally only:
+
+```yaml
+api:
+  environment:
+    APP_ENV: local
+    APP_DEBUG: "true"
+```
+
+Compose merges these keys into `api`'s existing `environment:` block. They have to sit under
+`environment:`; placed directly under `api:` they're rejected as unknown service properties.
+`"true"` is quoted so it stays the string Laravel expects rather than becoming a YAML boolean.
+
+**What it buys you:** real error messages. With debug off, a failure comes back as
+`{"message":"Internal server error"}`, and the logs are the only place that says why. With it
+on, the response includes the actual exception and a short trace, so a missing table shows
+up as *relation "users" does not exist* right in your `curl` output.
+
+**Why it can't leak:** production never loads `compose.dev.yml`, so there `APP_ENV` stays at
+the image's built-in `production` and `APP_DEBUG` stays off. Error detail can include file
+paths, SQL and configuration, which is exactly what you want locally and never on a public
+server.
+
+**The trade-off, honestly stated:** this is a deliberate exception to "the dev file only adds
+ports". `APP_ENV=local` changes more than error output; for example, `artisan migrate` no
+longer asks for confirmation, so `--force` becomes unnecessary. So locally you run a slightly
+different configuration from production. Error reporting is the one difference worth that
+cost. Behaviour that changes what the app actually *does* should stay identical in both.

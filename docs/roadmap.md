@@ -14,25 +14,34 @@ scratch notes — this file is the version meant for anyone else reading this re
       both app repos — a release cannot publish without CI passing first.
 - [x] `compose.yml` — all six services, wired together with least-privilege environment
       variables (no blanket `env_file:`).
-- [x] `compose.override.yml` — local-only port exposure for Postgres/Redis/RabbitMQ,
-      kept out of production via `docker compose -f compose.yml ...`.
+- [x] `compose.dev.yml` — local-only port exposure for Postgres/Redis/RabbitMQ, applied
+      only when passed explicitly, so the plain command is the production-safe one.
 - [x] `proxy/default.conf` — routes `/` to `frontend`, `/api/` to `api` via FastCGI.
 - [x] Container/service-level healthchecks on all six services, with `depends_on:
       condition: service_healthy` gating startup order end-to-end.
+- [x] One-shot `migrate` service: migrations run on every `up`, and `api` won't start
+      unless they succeed.
+- [x] Laravel logs to stderr (`docker compose logs api`), with Docker log rotation.
+- [x] Local debug mode via `compose.dev.yml`.
+- [x] First real run: all six services healthy, routing verified end to end, first admin
+      created and logged in. See [hands-on.md](./hands-on.md#first-start--from-an-empty-database-to-a-working-login).
 - [x] `.env.example` + `docs/` written up.
 
 ## Next
 
+- [ ] **In `laravel-shop-api`, before any public deploy:** close the open
+      `/api/admin/register`, and make `/api/admin/login` (and the admin routes) check
+      `system_role`. Today any registered customer can get an admin-endpoint token.
 - [ ] Provision a real server manually (install Docker + Compose plugin, open only
       `80`/`443` at the firewall, create a deploy user).
-- [ ] First manual deploy on that server — copy `compose.yml` + a real `.env.prod`,
-      `docker compose -f compose.yml --env-file .env.prod up -d`, verify by hand.
+- [ ] First manual deploy on that server — copy `compose.yml` + a real `.env`,
+      `docker compose up -d`, verify by hand.
 - [ ] Write `healthcheck.sh` (container health via `docker compose ps` / `docker inspect`,
-      **plus** an end-to-end probe through the proxy against `/health/ready` — currently
-      those HTTP endpoints exist but nothing calls them; this script is their first real
-      consumer), `deploy.sh` (pull target version, `up -d`, run healthcheck, roll back on
-      failure), `rollback.sh` (reset `API_VERSION`/`FRONTEND_VERSION` to the previous
-      known-good tag, `up -d`).
+      **plus** end-to-end checks through the proxy: `/` answered by the frontend, an
+      unauthenticated `/api/user` answered by Laravel with a 401 *in JSON*, and
+      `/health/ready`, whose HTTP endpoints nothing calls automatically yet), `deploy.sh`
+      (pull target version, `up -d`, run healthcheck, roll back on failure), `rollback.sh`
+      (reset `API_VERSION`/`FRONTEND_VERSION` to the previous known-good tag, `up -d`).
 - [ ] Repeat that deploy → healthcheck → rollback cycle by hand until it's second nature.
 - [ ] Add a real `listen 443 ssl` server block, once a domain + certificate (Let's
       Encrypt/Certbot) exist — see [nginx.md](./nginx.md#https-443) for why this can't be
@@ -64,8 +73,8 @@ One thing still open:
 
 - On the infrastructure side, only the **console** form is actually wired up — `api`'s
   Docker healthcheck runs `php artisan health:check`. The HTTP endpoints are routed and
-  reachable (see [nginx.md](./nginx.md#who-calls-these-nothing-yet--and-thats-deliberate))
-  but have no automated caller until `healthcheck.sh` exists.
+  reachable by hand, but nothing calls them automatically until `healthcheck.sh` exists
+  (see [nginx.md](./nginx.md#who-calls-these-no-docker-healthcheck--only-you-for-now)).
 
 ## Later: evaluate a deployment tool
 

@@ -11,3 +11,8 @@ services:
     ports:
       - "15672:15672"
       - "5672:5672"
+
+  api:
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
