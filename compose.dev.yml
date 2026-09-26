@@ -1,0 +1,18 @@
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    ports:
+      - "15672:15672"
+      - "5672:5672"
+
+  api:
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
